@@ -1,0 +1,801 @@
+---
+title: "Cultural Favoritism in the Eurovision Song Contest: Can Experts Do Better?"
+author: "Xiaotong Du"
+date: last-modified
+date-format: "MMMM DD, YYYY"
+format: 
+  pdf:
+    df-print: paged
+header-includes:
+      - \usepackage{float}
+      - \floatplacement{table}{H}
+crossref:
+  fig-title: '**Figure**'
+  fig-labels: arabic
+  title-delim: "**.**"
+execute:
+  echo: false
+  message: false
+  warning: false
+bibliography: references.json
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| include: false
+
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+
+library(tidyverse)
+library(tidyr)
+library(readr)
+library(purrr)
+library(countrycode)
+library(survival)
+library(modelsummary)
+library(nnet)
+library(haven)
+library(gtsummary)
+library(gt)
+library(lmtest)
+library(broom)
+library(kableExtra)
+library(here)
+library(rvest)
+
+options(modelsummary_get = "broom")
+options(knitr.kable.NA = '')
+
+```
+
+The Eurovision Song Contest(ESC) has become one of the longest-running international music competitions and television programmes in the world since its inception in 1956, attracting hundreds of millions of viewers around the globe every year. Behind this spectacle, however, lies a long-standing debate: do participating countries' votes reflect a genuine appreciation of music, or are they swayed by geopolitical and cultural proximity? This report seeks to answer this question by investigating the impact of country-specific and song-specific factors on the scoring outcome of the contest. Three key research questions guide my study: (1) Does the country submitting the song significantly affect the competition result for that song? (2) Would expert juries be fairer than the public in their scoring? (3) Does scoring fairness vary across different countries?
+
+Drawing on ESC scoring data from 2016 to 2023, this report reveals a clear preference for scoring based on geographical and cultural proximity. However, factors directly related to the song, such as song style, BPM (Beats Per Minute), and instrumentalness, exhibit minimal impact on scoring. Since 2016, scores from juries and tele-votings have been tallied separately. This allows for comparing biases between experts and the general public, and helps identify both positive and negative biases. There is insufficient evidence to suggest that expert scoring is more impartial, but rather that juries from Islamic and Orthodox countries are more prone to bias. Generally, scorers show a positive bias towards countries in the same region and with the same language, regardless of whether they are professionals or not.
+
+## Background
+
+Cultural proximity theory suggests that people will gravitate towards their own or similar culture when selecting media or trade partners[@felbermayr2010]. Extensive research on the ESC has provided empirical evidence for this theory. In the ESC, there is ongoing debate about vote collusion and contestants attempting to "appealing" other participating countries by emphasizing certain cultural characteristics. Three geographical voting "blocs", Western, Mediterranean and Northern, were found in the contest as early as 1995[@yair1995]. With the discovery of voting blocs between countries with no geographical proximity, the study of voting collusion expanded to include more factors of cultural proximity, revealing voting preferences for countries with similar languages, histories and religions. The study that inspired my report is Budzinski and Pannicke's comparative empirical study of voting bias in the Eurovision Song Contest and the German Song Contest[@budzinski2016]. They tested how song-related factors and factors related to cultural similarity between countries drive voting bias. I follow their method to measure bias and make further distinctions between juries and tele-votings, and between the positive and negative bias.
+
+In this report, I investigate how strong the tie between scoring and cultural proximity by using region, religion, and official language as three cultural dimensions, and by adding song-related factors, such as performance form, song language, style, BPM, and instrumentalness as additional explanatory variables. I expected that cultural proximity would explain the winner choice by the participating countries more than song-related factors, which would indicate the presence of cultural bias in scoring. In further analyses of scoring bias, I expect that juries should be less influenced by cultural proximity than general audiences and more able to give objective scores based on the artistry of the song. Considering that different countries have different cultural environments, I also expect that the level of bias in audience voting will vary from country to country. Notably, political factors may weaken the preference for cultural proximity and affect the scoring outcomes. For example, war may substantially weaken preferences arising from cultural proximity. Israel faces the situation this year. The impact of this factor can be reduced if the study covers a longer period, but this issue has not been addressed in this report.
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+df_song <- read.csv("Eurovision/song_data.csv", header = T)
+
+# songs attributes
+
+song_attr <- df_song |> 
+  filter(year > 2015) |> 
+  select(year, country, gender, language, style, direct_qualifier_10, main_singers, 
+         BPM, instrumentalness) |> 
+  mutate(language = iconv(language, "UTF-8", "ASCII", sub = " "),
+         language = case_when(
+           language == "English" ~ "English",
+           grepl("English", language) ~ "Mix",
+           TRUE ~ "Own"),
+         language = as.factor(language),
+         year = as.character(year),
+         style = as.factor(style),
+         style = relevel(style, ref = "Traditional"),
+         qualification = if_else(direct_qualifier_10 == 1, 1, 0),
+         format = case_when(
+           gender == "Female" & main_singers == 1 ~ "Female Solo",
+           gender == "Male" & main_singers == 1 ~ "Male Solo",
+           TRUE ~ "Group"),
+         format = as.factor(format),
+         format = relevel(format, ref = "Male Solo"),
+         BPM = as.integer(BPM),
+         instrumentalness = as.integer(instrumentalness)) |> 
+  select(-direct_qualifier_10)
+
+# region data
+
+region_attr <- read.csv("Eurovision/country_data.csv", header = T) |> 
+  add_row(country = "Rest of the World", region = "Out of Europe")
+
+# religion data
+
+raw_religion_df <- read_dta("Eurovision/World Religion Project - National Religion Dataset.DTA") |> 
+  filter(year == 2010) |> 
+  select(-7:-43) 
+
+religion_df <- raw_religion_df |> 
+  mutate(others = rowSums(select(raw_religion_df, 30:39)),
+         others = others + otgenpct) |> 
+  select(ISO3, country, chprtpct, chcatpct, chortpct, changpct, chothpct, 
+         jdgenpct, isgenpct, bugenpct, others, norelpct)
+
+## considering the religion with the largest share of the population as the main religion of the country
+religion_df <- religion_df |> 
+  mutate(religion = colnames(religion_df)[apply(religion_df[, 3:12], 1, which.max) + 2])
+
+replacement_map <- c("chprtpct" = "Christianity: Protestants",
+                     "chcatpct" = "Christianity: Catholics",
+                     "chortpct" = "Christianity: Orthodox",
+                     "changpct" = "Christianity: Other",
+                     "chothpct" = "Christianity: Other",
+                     "jdgenpct" = "Judaism",
+                     "isgenpct" = "Islam",
+                     "bugenpct" = "Others",
+                     "others" = "Others",
+                     "norelpct" = "Non-religious")
+
+for (old_value in names(replacement_map)) {
+  new_value <- replacement_map[old_value]
+  religion_df$religion <- gsub(old_value, new_value, religion_df$religion)
+}
+
+religion_attr <- religion_df |> 
+  select(ISO3, religion)
+
+# if voter country and contestant have at least one common official language
+
+language_attr <- read_dta("Eurovision/ling_web.dta") |>
+  mutate(iso_o = case_when(
+    iso_o == "BLX" ~ "BEL",
+    TRUE ~ iso_o),
+    iso_d = case_when(
+      iso_d == "BLX" ~ "BEL",
+      TRUE ~ iso_d
+      )) |>
+  select(1, 3, 5)
+
+# add some data to optimize the missing value when adding this attributes into the voting dataset
+
+## I copied the BIH data into SRB given the similarity between BIH and SRB. ITA and SMR, and BIH and MNE were handled in the same way
+subset1 <- language_attr[language_attr$iso_o %in% c("BIH", "ITA") |
+                         language_attr$iso_d %in% c("BIH", "ITA"), ]
+subset1$iso_o <- gsub("BIH", "SRB", subset1$iso_o)
+subset1$iso_o <- gsub("ITA", "SMR", subset1$iso_o)
+subset1$iso_d <- gsub("BIH", "SRB", subset1$iso_d)
+subset1$iso_d <- gsub("ITA", "SMR", subset1$iso_d)
+subset2 <- language_attr[language_attr$iso_o == "BIH" | language_attr$iso_d == "BIH", ]
+subset2$iso_o <- gsub("BIH", "MNE", subset2$iso_o)
+subset2$iso_d <- gsub("BIH", "MNE", subset2$iso_d)
+new_subset <- rbind(subset1, subset2)
+language_attr <- rbind(language_attr, new_subset) |> 
+  add_row(iso_o = "ITA", iso_d = "SRB", col = 0) |>
+  add_row(iso_o = "SRB", iso_d = "ITA", col = 0) |>
+  add_row(iso_o = "ITA", iso_d = "SMR", col = 1) |>
+  add_row(iso_o = "SMR", iso_d = "ITA", col = 1) |> 
+  add_row(iso_o = "BIH", iso_d = "SRB", col = 1) |>
+  add_row(iso_o = "SRB", iso_d = "BIH", col = 1) |> 
+  add_row(iso_o = "MNE", iso_d = "SRB", col = 1) |>
+  add_row(iso_o = "MNE", iso_d = "SMR", col = 0)
+
+# combining voting results data
+
+tele_folder_path <- "Eurovision/Final Results/Televote"
+tele_file_list <- list.files(tele_folder_path, full.names = TRUE)
+
+jury_folder_path <- "Eurovision/Final Results/Jury"
+jury_file_list <- list.files(jury_folder_path, full.names = TRUE)
+
+process_file <- function(file_path) {
+  df <- read.csv(file_path, header = TRUE)
+  file_name <- basename(file_path)
+  year <- substr(file_name, 1, 4)
+  df <- df[, -c(2:4)]
+  df_long <- pivot_longer(df, cols = -1, names_to = "voter_country", values_to = "score") |> 
+    arrange(voter_country, desc(score)) |> 
+    mutate(voter_code = if_else(voter_country != "Rest.of.the.World",
+                                countrycode(voter_country, "country.name", "iso3n"), 0),
+           voter_iso = if_else(voter_country != "Rest.of.the.World",
+                              countrycode(voter_country, "country.name", "iso3c"), "NULL"),
+           Contestant_iso = countrycode(Contestant, "country.name", "iso3c")) |> 
+    select(voter_code, voter_iso, voter_country, Contestant, Contestant_iso, score)
+  df_long <- mutate(df_long, year = year)
+  return(df_long)
+}
+
+tele_df_list <- map(tele_file_list, process_file)
+tele_df_list <- map(tele_df_list, ~ mutate(.x, tele_score = score) %>% select(-score))
+
+jury_df_list <- map(jury_file_list, process_file)
+jury_df_list <- map(jury_df_list, ~ mutate(.x, jury_score = score) %>% select(-score))
+
+tele_combined_df <- bind_rows(tele_df_list)
+jury_combined_df <- bind_rows(jury_df_list)
+
+```
+
+## Data
+
+For this report, I use a complete historical scoring results data set of the ESC from 2016 to 2023 (excluding 2020, when the ESC was suspended)[^1]. For each year, each participating country selected one original song to be performed and broadcast live, which is then scored by other participating countries. The country with the highest final score will be the winner. The voting results consist of two parts: the jury scoring results and the tele-voting results, which show the number of points each participating country awarded other countries that made it to the final. The jury and the tele-voters in each participating country chose 10 favourite songs separately, allocating them 12, 10, 8, 7, 6, 5, 4, 3, 2 and 1 points. I thus code the songs that do not get points from that participant country as 0 points.
+
+[^1]: Data can be accessed at <https://www.kaggle.com/datasets/diamondsnake/eurovision-song-contest-data>.
+
+#### Explanatory Variables
+
+My choice of explanatory variables is based on different dimensions of cultural proximity and previous research on ESC voting bias (see Background section). Countries geographically close to each other often share intertwined historical and cultural backgrounds. Therefore, I included the region as an independent variable and classified it into four categories: Outside Europe, Eastern Europe, Scandinavia, and Western Europe. I also create a dummy variable to capture whether the voting and the voted countries are located in the same region.
+
+Language and religion are two important cultural traits, and Spierdijk and Vellekoop[@spierdijk2008] suggest that these traits could influence a country's preferences in music. Therefore, I create a dummy variable to capture whether the voting and the voted countries use at least one of the same official languages[^2]. For the religion variable, I treat a country to be non-religious if it has the highest percentage of people with no religion, and otherwise treat the religion with the highest percentage of people as the country's major religion, distinguishing between Catholics, Orthodox, Protestants, other Christianity, Judaism, and Islam[^3]. I also create a dummy variable to capture whether the voting country and the voted country have the same religion.
+
+[^2]: I obtained the language dummy variable from <http://www.cepii.fr/CEPII/en/bdd_modele/bdd.asp>.
+
+[^3]: I obtained the major religions from <https://www.cia.gov/library/publications/the-world-factbook/>.
+
+Additional explanatory variables related to music are taken from the official ESC data, including performance format and song language, which characterize the performance, and style, BPM and instumentalness, which characterize the song. I divided the performance format into solo male singers, solo female singers, and group performances. I categorize the song language into English songs, songs containing English and songs using only the national language. Style follows the official ESC categorization. Instumentalness representing the proportion of vocals and instruments in a song, and I treat both this variable and BPM as continuous variables.
+
+#### Descriptive statistics
+
+In 2023, the contest introduced viewer voting from non-participating countries, and their votes were aggregated as a set of tele-voting scores, but these votes had no corresponding jury scores and couldn't be compared. So, I excluded these tele-voting data and then tabulated the scores given to each country from the other countries for each year, yielding a total of $7163$ observations. A statistical description of these observations is presented in @tbl-desccm, where I treat each year's vote as independent, e.g., each year that France gives Sweden a vote is treated as a different choice. Each year the highest total jury and TV vote score given by each voting country is considered to be chosen by that country. According to ESC rules, the winner is determined by the sum of the jury score and the tele-voting score, and in the case of a tie, the winner is the country that received more points from televoting. Therefore, if it appears in my data that a voting country gave the same total score to both voted countries, the country with the higher TV vote score is chosen.
+
+As stated in @tbl-desccm, all participating countries have made $284$ choices in seven years, which can be considered as the winners selected by the voting countries. It is clear that a higher proportion of the chosen countries have the same region as the voting countries than the non-chosen countries ($45\%$ vs. $31\%$). The same goes for religion ($38\%$ vs. $22\%$) and language ($14\%$ vs. $3\%$). Among the factors related to songs, the voting countries favoured male solo over other performance formats, and songs in the national language and smaller instrumentalness were preferred. Song style and BPM, on the other hand, did not differ much between the chosen and non-chosen songs. Note that there are a small number of missing values for the BPM and instrumentalness variables, which I only used in the models that state in the appendix, and the missing values were deleted when used.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "Descriptive statistics for ESC participates and songs"
+#| label: tbl-desccm
+
+# data description
+
+## combining voting results
+
+combined_df <- left_join(tele_combined_df, jury_combined_df,
+          by = c("voter_country","voter_code","Contestant","year","voter_iso","Contestant_iso"))
+
+combined_df <- combined_df |>
+  mutate_at(vars(jury_score, tele_score), ~replace_na(., 0)) |>
+  mutate(total_score = jury_score + tele_score) |>
+  filter(voter_country != Contestant & voter_iso != Contestant_iso)
+
+combined_df <- combined_df |> 
+  mutate(voter_country = gsub("\\.", " ", voter_country),
+         voter_country = gsub("Czechia", "Czech Republic", voter_country))
+
+# adding variables
+
+combined_attr <- left_join(combined_df, region_attr,
+                            by = c("voter_country" = "country")) %>%
+  rename(voter_region = region)
+
+combined_attr <- left_join(combined_attr, region_attr,
+                            by = c("Contestant" = "country")) %>%
+  rename(Contestant_region = region)
+
+combined_attr <- left_join(combined_attr, song_attr,
+                     by = c("Contestant" = "country", "year" = "year"))
+
+combined_attr <- left_join(combined_attr, religion_attr,
+                            by = c("voter_iso" = "ISO3")) |>
+  rename(voter_religion = religion)  |>
+  mutate(voter_religion = if_else(is.na(voter_religion), "Unkown", voter_religion))
+
+combined_attr <- left_join(combined_attr, religion_attr,
+                            by = c("Contestant_iso" = "ISO3")) |>
+  rename(Contestant_religion = religion)
+
+combined_attr <- left_join(combined_attr, language_attr,
+                         by = c("voter_iso" = "iso_o", "Contestant_iso" = "iso_d")) |>
+  mutate(common_language = if_else(col == 1, "Same", "Different"),
+    common_language = as.factor(common_language)) |>
+  select(-col)
+
+total_df <- combined_attr |> 
+  filter(voter_country != "Rest of the World") |> 
+  group_by(year, voter_country)  |> 
+  mutate(tele_choice = if_else(tele_score == max(tele_score, na.rm = TRUE), 1, 0),
+         jury_choice = if_else(jury_score == max(jury_score, na.rm = TRUE), 1, 0)) |> 
+  mutate(max_total_score = max(total_score, na.rm = TRUE),
+    max_tele_score = max(tele_score[total_score == max_total_score], na.rm = TRUE),
+    total_choice = if_else(total_score == max_total_score & tele_score == max_tele_score, 1, 0)
+  ) |> 
+  ungroup() |> 
+  mutate(voter_code = sprintf("%s%04d", year, voter_code),
+         voter_code = as.integer(voter_code),
+         region = if_else(voter_region == Contestant_region, "Same", "Different"),
+         region = as.factor(region),
+         religion = as.factor(if_else(voter_religion == Contestant_religion, "Same", 
+                                      "Different")),
+         qualification = if_else(qualification == 1, "Direct to Final", "Other Contestants"),
+         qualification = as.factor(qualification),
+         qualification = relevel(qualification, ref = "Other Contestants"),
+         voter_religion = as.factor(voter_religion),
+         voter_religion = relevel(voter_religion, ref= "Non-religious"),
+         voter_region = as.factor(voter_region),
+         voter_region = relevel(voter_region, ref = "Out of Europe"))
+
+cm_df <- total_df |> 
+  mutate(total_choice_fact = factor(total_choice,
+                                   labels = c("Unchosen", "Chosen")))
+
+Nvoting <- length(unique(cm_df$voter_code))
+reset_gtsummary_theme()
+
+cm_df |> select(total_choice_fact) |> mutate(N=1) |> mutate(Pct=100*1/n()) |> 
+  tbl_summary(by = total_choice_fact, 
+              type = list(N ~ 'continuous',Pct~'continuous'),
+              statistic=list(N ~"{sum}",Pct~"{sum} %"),
+              digits=list(N~0,Pct~0),
+              label = list(Pct~"% alternatives")) |> 
+  add_overall(last=T) |> 
+  modify_header(update=all_stat_cols() ~ "{level}") |> 
+  modify_header(label="Variable") |> 
+  modify_footnote(update = everything()~NA) -> 
+  tbl_top
+
+cm_df |> 
+  mutate() |> 
+  select(total_choice_fact, region, religion, common_language, 
+         format, language, style, BPM, instrumentalness) |> 
+  tbl_summary(by = total_choice_fact,
+              statistic=list(
+                all_categorical()~'{p}%',
+                all_continuous()~'{mean} ({sd})'),
+              digits=list(
+                all_categorical()~0,
+                all_continuous()~2),
+              missing_text = "(Missing)",
+              label=list(
+                common_language ~ "Official Language",
+                language ~ "Song Language",
+                style ~ "Song Style",
+                region ~ "Region",
+                religion ~ "Religion",
+                format ~ "Performance Format",
+                instrumentalness ~ "Instrumentalness")) |>
+  add_overall(col_lab="**Overall**", last=T) |>
+  modify_header(update=all_stat_cols() ~ "{level}") |> 
+  modify_header(label="Variable") |> 
+  modify_footnote(update=all_stat_cols()~NA) -> 
+  tbl_bot
+
+tbl_stack(list(tbl_top,tbl_bot)) |> 
+  as_kable_extra(threepartable=T,booktabs=T,linesep="") |> 
+  add_header_above(header=c(" "=1,"Choice"=2," "=1)) |> 
+  footnote(general=c(paste0("Number of choices made by voting countries(2016-2023) = ",
+                            Nvoting),
+                     "Summary statistics for continuous variables: Mean (SD);",
+                     "Source: Eurovision Song Contest Data from Kaggle.",
+                     "The scale of BPM is 66-174. The scale of instrumentalness is 0-96."))
+
+```
+
+There are $1815$ distinct combinations of voting and voted countries in @tbl-desccm. I then calculated the average voting bias of the voting countries against the voted countries, based on the deviation from the average score that the voted countries received over the seven years (detailed in the Methods section). However, some countries have only participated one time in the final, and calculating voting bias based on just one vote is insufficient, so I filtered out these countries and yielded $1590$ observations. I categorized voting outcomes into negative bias (Hate), positive bias (Preferred) and reasonable according to calculated bias, and these observations are described in @tbl-descbm. Nearly $90\%$ of both the jury and the tele-voting scores were considered to be reasonable, while $8\%$ of the scoring were considered to display preference. Same region, same language, and same religion were significantly more prevalent in positive biased scoring than in other types of scoring. @tbl-descbm also shows that the jury ratings show that Western European countries have a higher percentage of Reasonable scoring than biased scoring, and the opposite is true for Eastern European countries; many of the countries located in Eastern Europe are Orthodox, and Orthodox countries are more likely to have biases. The same goes for Islamic countries, but surprisingly, this is no longer the case in their tele-voting results.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "Descriptive statistics for voting and voted countries"
+#| label: tbl-descbm
+
+# creating binary and multinomial data set
+
+contestant_score <- total_df |> 
+  group_by(year, Contestant) |> 
+  summarise(voter_number = n_distinct(voter_iso),
+            jury_score = sum(jury_score),
+            tele_score = sum(tele_score),
+            total_score = sum(total_score)) |> 
+  group_by(Contestant) |> 
+  summarise(year = n(),
+            voter_number = sum(voter_number),
+            jury_score = sum(jury_score),
+            tele_score = sum(tele_score),
+            total_score = sum(total_score)) |> 
+  mutate(jury_ave_score = jury_score / voter_number,
+         tele_ave_score = tele_score / voter_number,
+         total_ave_score = total_score / voter_number) |> 
+  ungroup() |> 
+  select(Contestant, jury_ave_score, tele_ave_score, total_ave_score)
+
+bm_df <- total_df |>
+  group_by(voter_country, Contestant, 
+           region, common_language, religion, voter_region, voter_religion) |> 
+  summarise(year = n(),
+            jury_score = sum(jury_score),
+            tele_score = sum(tele_score),
+            total_score = sum(total_score)) |> 
+  mutate(voting_ave_jury = jury_score/year,
+         voting_ave_tele = tele_score/year,
+         voting_ave_total = total_score/year) |> 
+  ungroup()
+
+bm_df <- left_join(bm_df, contestant_score, by = "Contestant")
+
+bm_df <- bm_df |> 
+  mutate(jury_score_deviation = round(voting_ave_jury - jury_ave_score),
+         tele_score_deviation = round(voting_ave_tele - tele_ave_score),
+         total_score_deviation = round(voting_ave_total - total_ave_score),
+         jury_bias = ifelse(abs(jury_score_deviation-mean(jury_score_deviation)) < sd(jury_score_deviation), "Reasonable", ifelse(jury_score_deviation < 0, "Hate", "Preferred")),
+         tele_bias = ifelse(abs(tele_score_deviation-mean(tele_score_deviation)) < sd(tele_score_deviation),  "Reasonable", ifelse(jury_score_deviation < 0, "Hate", "Preferred")),
+         total_bias = ifelse(abs(total_score_deviation--mean(total_score_deviation)) < sd(total_score_deviation), 
+                            "Reasonable", ifelse(jury_score_deviation < 0, "Hate", "Preferred")),
+         jury_bias = as.factor(jury_bias),
+         jury_bias = relevel(jury_bias, ref = "Reasonable"),
+         tele_bias = as.factor(tele_bias),
+         tele_bias = relevel(tele_bias, ref = "Reasonable"),
+         total_bias = as.factor(total_bias),
+         total_bias = relevel(total_bias, ref = "Reasonable"),
+         bino_jury = ifelse(jury_bias == "Reasonable", 0, 1),
+         bino_tele = ifelse(tele_bias == "Reasonable", 0, 1),
+         bino_total = ifelse(total_bias == "Reasonable", 0, 1))
+
+ppre_df <- bm_df
+
+bm_df <- bm_df |> 
+  filter(year > 1)
+
+NVcountry <- length(unique(c(bm_df$voter_country,bm_df$Contestant)))
+reset_gtsummary_theme()
+
+bm_df |> select(jury_bias) |> mutate(N=1) |> mutate(Pct=100*1/n()) |> 
+  tbl_summary(by = jury_bias, 
+              type = list(N ~ 'continuous',Pct~'continuous'),
+              statistic=list(N ~"{sum}",Pct~"{sum} %"),
+              digits=list(N~0,Pct~0),
+              label = list(Pct~"P(%)")) |> 
+  add_overall(last=T) |> 
+  modify_header(update=all_stat_cols() ~ "{level}") |> 
+  modify_header(label="Variable") |> 
+  modify_footnote(update = everything()~NA) -> 
+  jury_top
+
+bm_df |> 
+  select(jury_bias, region, common_language, religion, voter_region, voter_religion) |> 
+  tbl_summary(by = jury_bias,
+              statistic=list(all_categorical()~'{p}%'),
+              digits=list(all_categorical()~0),
+              missing_text = "(Missing)",
+              label=list(
+                common_language ~ "Official Language",
+                region ~ "Region",
+                religion ~ "Religion",
+                voter_region ~ "Voter Region",
+                voter_religion ~ "Voter Religion")) |>
+  add_overall(col_lab="**Overall**", last=T) |>
+  modify_header(update=all_stat_cols() ~ "{level}") |> 
+  modify_header(label="Variable") |> 
+  modify_footnote(update=all_stat_cols()~NA) -> 
+  jury_bot
+
+bm_jury <- tbl_stack(list(jury_top,jury_bot))
+
+bm_df |> select(tele_bias) |> mutate(N=1) |> mutate(Pct=100*1/n()) |> 
+  tbl_summary(by = tele_bias, 
+              type = list(N ~ 'continuous',Pct~'continuous'),
+              statistic=list(N ~"{sum}",Pct~"{sum} %"),
+              digits=list(N~0,Pct~0),
+              label = list(Pct~"P(%)")) |> 
+  add_overall(last=T) |> 
+  modify_header(update=all_stat_cols() ~ "{level}") |> 
+  modify_header(label="Variable") |> 
+  modify_footnote(update = everything()~NA) -> 
+  tele_top
+
+bm_df |> 
+  select(tele_bias, region, common_language, religion, voter_region, voter_religion) |> 
+  tbl_summary(by = tele_bias,
+              statistic=list(all_categorical()~'{p}%'),
+              digits=list(all_categorical()~0),
+              missing_text = "(Missing)",
+              label=list(
+                common_language ~ "Official Language",
+                region ~ "Region",
+                religion ~ "Religion",
+                voter_region ~ "Voter Region",
+                voter_religion ~ "Voter Religion")) |>
+  add_overall(col_lab="**Overall**", last=T) |>
+  modify_header(update=all_stat_cols() ~ "{level}") |> 
+  modify_header(label="Variable") |> 
+  modify_footnote(update=all_stat_cols()~NA) -> 
+  tele_bot
+
+bm_tele <- tbl_stack(list(tele_top,tele_bot))
+
+tbl_merge(tbls = list(bm_jury, bm_tele),
+  tab_spanner = c("Jury Results", "Televote Results")) |> 
+  as_kable_extra(threepartable=T,booktabs=T,linesep="") |> 
+  footnote(general=c("Source: Eurovision Song Contest Data from Kaggle")) |> 
+   kable_styling(latex_options = "scale_down")
+  
+
+
+```
+
+## Method
+
+In this report, I used three different analysis methods, each using a different dependent variable. For the conditional logistic regression, I used the highest total score given by the voting country as the outcome of that country's choice for each year, in other words, the winner that the voting country chose (see the Data section). I developed three conditional logit models, presented in @tbl-cmregress, using dummy variables for region, religion, and language, as well as the performance format and song language as explanatory variables. The first models included only the song-related variables, the second model included only dummy variables representing cultural proximity between countries, and the third model included all of the aforementioned variables. The last model was the best, so I used it to produce predicted probabilities for the ESC in 2024. The data sources for the data set used for prediction are the same as those used in the models.
+
+For multinational logistic regression and binary logistic regression, I used whether there is scoring bias (positive or negative bias) as the dependent variable. I measure scoring bias by following steps: Firstly, calculating the average annual score received by the voted country from all countries, and the average annual score received by the voted country from each voting country. For example, Austria received an average of 4.4 points per contest and received an average of 0.5 points from Albania; then, calculating the difference between the two scores (score deviation); finally, calculating the difference between the score deviation and its mean (mean score deviation), and calculating its standard deviation. If the absolute value of the mean score deviation is smaller than standard deviation, the score is considered to be reasonable, and if it is bigger than the standard deviation and the mean score deviation is less than 0, it is considered as negative bias and coded as "Hate", and vice versa as "Preferred".
+
+However, when I used voting countries' regions and religions as explanatory variables to explore which countries are more prone to scoring bias, the number of countries reduced to 0 to 2 for some bias types, affecting estimation accuracy. I thus merged negative and positive biases and employ binary logistic regression. Using the jury and tele-voting scoring data, I built two multinational logit models with dummy variables for region, religion and language, and two binary logit models with two categorical variables for region and religion of the voting country
+
+## Results
+
+The @tbl-cmregress shows that there is a significant difference among the three models. The second model, estimated using only the dummy variables representing the cultural proximity of countries, having a better goodness of fit than the first model, which only included the song-related variables. Model 2 not only showed improvement in both AIC and BIC, but provided a significantly better fit than the second one, according to the results of the likelihood ratio test ($\chi^2=25.06$ , $df=-1$, $p<0.001$). I also tried to add other song-related variables to the first model, such as style, BPM, and instrumentalness, but almost none of them were significant and resulted in an even worse model fit (see Appendix @tbl-regresssup), so I removed these variables from the model. Both BIC and AIC were further optimized in the third model, compared to the second. The likelihood ratio test comparing the two models also suggests that the third model is preferred ($\chi^2=83.9$, $df=3$, $p<0.001$).
+
+As can be seen in Models 1 and 3, male soloists and songs in minor languages are more favorable in the scoring. Compared to solo male singers, female soloists have about $30\%$ lower probability of being chosen, group performances are the least favored with about $70\%$ lower probability of being chosen, all else being equal, while the probability of winning by singing in one's national language is about $2.5-2.6$ times higher than that of an English song. In Model 2, the dummy variables for region, religion, and official language all had a significant effect on if a country could receive the highest score from the voting country. Region having a slightly weaker significance, perhaps because the other two factors, religion and official language, attenuated the cultural proximity represented by the region, which was no longer significant after including the song-related variables. In Model 3, the effects of religion and official language remain stable and significant. The probability of being chosen increases by $67\%$ if the voted country has the same religion as the voting country, and the probability of being chosen for a voted country that has the same official language as the voting country is $5.16$ times higher than other voted countries, holding other variables constant.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| label: tbl-cmregress
+#| tbl-cap: Odds from conditional logit models of winner choice
+
+# combining multinomial and conditional model
+
+names <- c("regionSame"="Same Region(ref: Different Region)",
+           "religionSame" = "Same Religion(ref: Different Religion)",
+           "common_languageSame" = "Same Language(ref: Different Language)",
+           "religionSame:common_languageLanguage" = "Same Religion × Same Language",
+           "regionSame:common_languageLanguage" = "Same Region × Same Language",
+           "formatFemale Solo" = "Female Solo",
+           "formatMale Solo" = "Male Solo",
+           "formatGroup" = "Group",
+           "languageMix" = "Mix",
+           "languageOwn" = "Own",
+           "styleBallad" = "Ballad",
+           "styleDance" = "Dance",
+           "styleOpera" = "Opera",
+           "stylePop" = "Pop",
+           "styleRock" = "Rock",
+           "voter_regionEastern Europe" = "Eastern Europe",
+           "voter_regionScandanavia" = "Scandanavia",
+           "voter_regionWestern Europe" = "Western Europe",
+           "voter_religionChristianity: Catholics" = "Christianity: Catholics",
+           "voter_religionChristianity: Orthodox" = "Christianity: Orthodox",
+           "voter_religionChristianity: Other" = "Christianity: Other",
+           "voter_religionChristianity: Protestants"	= "Christianity: Protestants",
+           "voter_religionIslam" = "Islam",
+           "voter_religionJudaism" = "Judaism",
+           "instrumentalness" = "Instrumentalness")
+
+mslist <- function(models) {
+  lrtests <- with(models,do.call(lmtest::lrtest, lapply(names(models), as.name)))
+  mslist <- modelsummary(models, output = "modelsummary_list", statistic = '{conf.high},{conf.low}')
+  i = 1
+  for(m in names(models)) {
+    mslist[[m]]$glance$df <- lrtests[["Df"]][i]
+    mslist[[m]]$glance$chisq <- lrtests[["Chisq"]][i]
+    mslist[[m]]$glance$p.value <- lrtests[["Pr(>Chisq)"]][i]
+    i = i + 1
+  } 
+  return(mslist)
+}
+
+gm <- modelsummary::gof_map |> 
+  mutate(omit = FALSE) |> 
+  slice(match(c("nobs","AIC","BIC","logLik","chisq","df","p.value"), raw)) |>
+  mutate(fmt = ifelse(raw == "AIC" | raw == "BIC" | raw == "logLik", 0, fmt))
+
+## estimate conditional logit models
+cm1 <- clogit(total_choice ~ format + language + strata(voter_code), data = cm_df)
+cm2 <- clogit(total_choice ~ region + religion + common_language +
+                strata(voter_code), data = cm_df)
+cm3 <- clogit(total_choice ~ region + religion + common_language + 
+                format + language + strata(voter_code), data = cm_df)
+
+cmods <- list(
+  "Model 1" = cm1, 
+  "Model 2" = cm2,
+  "Model 3" = cm3)
+
+cmlist <- mslist(cmods)
+
+modelsummary(cmlist, fmt = 2, stars = T,
+             coef_rename = names,
+             exponentiate = T,
+             gof_map = gm,
+             shape=term ~ model+statistic,
+             booktabs=TRUE) |> 
+  group_rows(index=c("Performance Format (ref: Male Solo)"= 2,
+                    "Song Language (ref: English)"= 2), bold=F) |>
+  add_footnote(c(paste0("Number of choices made by voting countries(2016-2023) = ",Nvoting),
+                     "Source: Eurovision Song Contest Data from Kaggle"),
+               notation="none") |> 
+  column_spec(2:7,latex_column_spec = "{l}{l}*{6}{c}")
+
+```
+
+I used Model 3 to make predictions about the probabilities of the winner in ESC 2024. The region, religion and official language variables of the participating countries were taken from the data set that used in the model, and the performance format and song language were taken from the ESC Wikipedia page[^4]. According to the predictions, the country most likely to win this year's ESC is France, followed by Italy and the Netherlands. However, the predicted likelihood of winning is generally very low, with even France predicted to have only about a $1.5\%$ probability of winning.
+
+[^4]: See on <https://en.wikipedia.org/wiki/Eurovision_Song_Contest_2024>.
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| label: fig-pplot
+#| fig-cap: "Predicted winner in 2024. Derived from conditonal logit model of winner choice."
+#| fig-width: 6
+#| fig-height: 4
+
+url <- "https://en.wikipedia.org/wiki/Eurovision_Song_Contest_2024"
+wiki_page <- read_html(url)
+
+tables <- html_table(wiki_page)
+
+contestants2024 <- tables[[4]] |> 
+  mutate(Language = gsub("\\[.*\\]", "", Language),
+         language = case_when(
+           Language == "English" ~ "English",
+           grepl("English", Language) ~ "Mix",
+           TRUE ~ "Own")) |> 
+  select(Country, language) 
+
+contestants2024$format <- c("Female Solo","Group","Group","Female Solo","Group","Male Solo",
+                            "Male Solo","Female Solo", "Female Solo", "Female Solo","Group", 
+                            "Group","Male Solo","Female Solo","Male Solo","Female Solo",
+                            "Female Solo","Female Solo", "Female Solo","Female Solo","Male Solo",
+                            "Male Solo","Female Solo", "Female Solo","Female Solo","Male Solo",
+                            "Group","Female Solo","Female Solo","Group","Female Solo",
+                            "Female Solo","Group","Group","Male Solo","Group","Male Solo")
+
+df2024 <- data.frame()
+
+for (country in contestants2024$Country) {
+  voting_df <- data.frame(voter_country = rep(country, length(contestants2024$Country) - 1), 
+                          Contestant = contestants2024$Country[-which(contestants2024$Country == country)])
+  
+  df2024 <- bind_rows(df2024, voting_df)
+}
+
+pre_df <- left_join(df2024, contestants2024, by = c("Contestant" = "Country")) 
+
+pre_attr <- ppre_df |> 
+  select(voter_country, Contestant, region, religion, common_language) |> 
+  mutate(Contestant = ifelse(Contestant == "Czech Republic", "Czechia", Contestant),
+         voter_country = ifelse(voter_country == "Czech Republic", "Czechia", voter_country))
+
+Luxembourg <- pre_attr |> 
+  filter(voter_country == "Belgium" | Contestant == "Belgium") |> 
+  mutate(voter_country = ifelse(voter_country =="Belgium", "Luxembourg",voter_country),
+         Contestant = ifelse(Contestant =="Belgium", "Luxembourg",Contestant)) |> 
+  add_row(voter_country = "Belgium", Contestant = "Luxembourg", 
+          region = "Same", religion = "Same", common_language = "Same") |> 
+  add_row(voter_country = "Luxembourg", Contestant = "Belgium", 
+          region = "Same", religion = "Same", common_language = "Same") |> 
+  add_row(voter_country = "Portugal", Contestant = "Georgia", 
+          region = "Different", religion = "Different", common_language = "Different") |> 
+  add_row(voter_country = "Portugal", Contestant = "Latvia", 
+          region = "Different", religion = "Different", common_language = "Different")
+
+pre_attr <- bind_rows(pre_attr, Luxembourg)
+
+pre2024 <- left_join(pre_df, pre_attr, by = c("voter_country" = "voter_country", "Contestant" = "Contestant")) |> 
+  mutate_at(vars(3:7), as.factor) |> 
+  mutate(format = relevel(format, ref = "Male Solo"))|> 
+  mutate(voter_code = rep(20160008, 1332))
+
+pred <- pre2024 %>%  
+  bind_cols(Za = predict(cm3, type = "lp", newdata = .)) %>%  
+  group_by(voter_code) %>%
+  mutate(Pr = exp(Za) / sum(exp(Za))) %>%
+  mutate(Model = "Model 4")
+
+ggplot(pred, aes(x = Contestant, y = Pr, fill = Contestant)) +
+  geom_bar(stat = "identity", position = "dodge", show.legend = FALSE) +
+  labs(x = "Contestants", y = "Probability of Being Winner") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Although the important role of cultural proximity has been established in @tbl-cmregress, it is important to note that the actual scoring bias may have been weakened in these models since I used the total score as the dependent variable. For example, if jury is scoring objectively, this would reduce the effect of tele-voting bias in the total score. Therefore, I further developed models using using jury and tele-voting scores separately.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| include: false
+
+# mutinomial model
+
+mm_jury <- multinom(jury_bias ~ region + religion + common_language, 
+                data = bm_df)
+mm_tele <- multinom(tele_bias ~ region + religion + common_language, 
+                data = bm_df)
+
+mmlist <- list(
+  "Jury Voters" = mm_jury,
+  "Tele Voters" = mm_tele)
+
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| label: tbl-mmregress
+#| tbl-cap: Odds ratio from multinomial logit models of scoring biases
+
+modelsummary(mmlist, fmt = 2, stars = T,
+             coef_rename = names,
+             exponentiate = T,
+             shape=term + statistic ~ model+y.level,
+             gof_map = "nobs",
+             booktabs=TRUE) |>
+  add_footnote(c("Source: Eurovision Song Contest Data from Kaggle"),
+               notation="none") |> 
+  column_spec(2:5,latex_column_spec = "{l}{l}*{4}{c}")
+```
+
+In @tbl-mmregress, cultural proximity had a lower effect on jury scores than on tele-voting scores, while I found no evidence of negative cultural bias. However, the positive effects of cultural proximity almost occur systematically, linking the voter country to the voted country. In particular, in tele-voting scoring, the odds of being preferred increase by $64\%$ if the voted country and the voter share the same religion, comparing to scoring objectively, and the increase in the odds of being preferred from locating on the same region and having the same official language is even more substantial, at $162\%$ and $295\%$, respectively. @tbl-bbregress, on the other hand, reveals that Orthodox and Islamic countries are more likely to have biased jury ratings. However, the actual scoring bias could be weakened by combining positive and negative bias, affecting the robustness of the results.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| label: tbl-bbregress
+#| tbl-cap: Odds ratio from binary logit models of scoring biases
+
+# binary model
+
+jury_bm <- glm(bino_jury ~ voter_region + voter_religion, 
+               data = bm_df, family = "binomial")
+tele_bm <- glm(bino_tele ~ voter_region + voter_religion, 
+               data = bm_df, family = "binomial")
+
+bmodels <- list("Jury Result" = jury_bm,
+                "Televote Result" = tele_bm)
+
+modelsummary(bmodels, stars = T,
+             coef_rename = names,
+             exponentiate = T,
+             shape=term ~ model+statistic,
+             gof_map = list(list(raw = "nobs", clean = "Num.Obs.", fmt = 0),
+                            list(raw = "AIC", clean = "AIC", fmt = 2),
+                            list(raw = "BIC", clean = "BIC", fmt = 2)),
+             booktabs=TRUE) |> 
+  group_rows(index=c(" " = 1,
+                     "Voter Region(ref: Out of Europe)"= 3,
+                    "Voter religion(ref: Non Religious)"= 6), bold=F) |>
+  add_footnote(c("Source: Eurovision Song Contest Data from Kaggle"),
+               notation="none") |> 
+  column_spec(2:4,latex_column_spec = "{l}{l}*{3}{c}")
+```
+
+## Discussion
+
+In this report, I attempt to find evidence of cultural proximity bias in ESC scoring. I distinguish between bias in jury and tele-voting scoring to answer the question of whether experts are more impartial than the public, and attempt to clarify the two extreme scores: positive bias (which indicates "preferred") and negative bias (which indicates "hate"). Overall, the results of my modeling were generally consistent with my hypothesis that cultural proximity explains more about winning than song-related factors, although the language and performance format of the song are also important. It is worth mentioning that almost none of the variables directly related to the song were significant(see Appendix @tbl-regresssup), which may indicate that it is difficult for scorers to transcend preferences for similar cultures, and that the winner may not be the country that displayed the best song, but rather the country that received the most recognition. Such a result is clearly unfortunate for a singing competition. In addition, there is insufficient evidence that jury scores are more impartial. Although juries were less significantly affected by cultural proximity than the public, statistical significance was still maintained. Meanwhile, when investigating the effect of national characteristics on scoring bias, I found that jury scores from Orthodox and Islamic countries are more likely to be biased, whereas tele-voting is not.
+
+There are many limitations in this report. First, my classification of regions is rather crude, as countries in the Mediterranean region are more similar but are classified as Western Europe, and some researchers also take historical factors into account when classifying regions as "former Yugoslavia", "former Soviet Union", etc[@blangiardo2014]. Secondly, I would like to use a binary regression model to investigate what kind of countries are more prone to bias, but there are too few independent variables to provide a good response to this question. Finally, the small amount of data weakened the model robustness because only seven years of data were used.
+
+## Appendix
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| label: tbl-regresssup
+#| tbl-cap: Supplementary conditional models of winner choice
+
+cm5 <- clogit(total_choice ~ format + language + style + strata(voter_code), data = cm_df)
+cm6 <- clogit(total_choice ~ format + language + style + BPM + instrumentalness + strata(voter_code), data = cm_df)
+
+supcmlist <- list("Model 5" = cm5,
+                  "Model 6" = cm6)
+
+modelsummary(supcmlist, fmt = 2, stars = T,
+             coef_rename = names,
+             exponentiate = T,
+             shape=term ~ model+statistic,
+             gof_map = list(list(raw = "nobs", clean = "Num.Obs.", fmt = 0),
+                            list(raw = "AIC", clean = "AIC", fmt = 2),
+                            list(raw = "BIC", clean = "BIC", fmt = 2)),
+             booktabs=TRUE) |> 
+  group_rows(index=c("Performance Format (ref: Male Solo)"= 2,
+                     "Song Language (ref: English)" = 2,
+                    "Style (ref: Traditional)"= 5), bold=F) |>
+  add_footnote(c(paste0("Total number of voters(2016-2023) = ",Nvoting), 
+                     "Source: Eurovision Song Contest Data from Kaggle"),
+               notation="none") |> 
+  column_spec(2:5,latex_column_spec = "{l}{l}*{4}{c}")
+
+```
+
+## References
